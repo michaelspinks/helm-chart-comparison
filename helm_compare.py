@@ -135,7 +135,7 @@ def read_yaml(path):
 
 
 def pointer(path):
-    return "/" + "/".join(str(part).replace("~", "~0").replace("/", "~1") for part in path)
+    return "".join("/" + str(part).replace("~", "~0").replace("/", "~1") for part in path)
 
 
 def deep_diff(old, new, path=()):
@@ -215,7 +215,16 @@ def compare_files(old_root, new_root):
 def compare_dependencies(old, new):
     def keyed(metadata):
         result = {}
-        for dep in metadata.get("dependencies") or []:
+        dependencies = metadata.get("dependencies")
+        if dependencies is None:
+            dependencies = []
+        if not isinstance(dependencies, list):
+            raise ValueError("Chart.yaml dependencies must be a list of mappings")
+        for dep in dependencies:
+            if not isinstance(dep, dict) or not isinstance(dep.get("name"), str) or not dep["name"]:
+                raise ValueError("Each Chart.yaml dependency must be a mapping with a nonempty name")
+            if "alias" in dep and (not isinstance(dep["alias"], str) or not dep["alias"]):
+                raise ValueError("Chart.yaml dependency aliases must be nonempty strings")
             key = dep.get("alias") or dep["name"]
             if key in result:
                 raise ValueError(f"Duplicate dependency name/alias: {key}")
@@ -273,7 +282,8 @@ def required_template_calls(root):
             for action in re.findall(r"{{-?(.*?)-?}}", text, re.DOTALL):
                 if re.search(r"\brequired\b", action):
                     for value in re.findall(r"\.Values((?:\.[A-Za-z0-9_-]+)+)", action):
-                        found.add(pointer(tuple(value.lstrip(".").split("."))))
+                        found.add((path.relative_to(root).as_posix(),
+                                   pointer(tuple(value.lstrip(".").split(".")))))
     return found
 
 
@@ -290,7 +300,7 @@ def customization_impacts(custom, changes):
     return impacts
 
 
-def assess_risk(old_root, new_root, values, templates, metadata, dependencies, custom=None):
+def assess_risk(old_root, new_root, values, templates, metadata, dependencies, custom=None, crds=None):
     findings = []
 
     def flag(severity, category, message, evidence):
@@ -311,7 +321,8 @@ def assess_risk(old_root, new_root, values, templates, metadata, dependencies, c
     template_required = sorted(required_template_calls(new_root) - required_template_calls(old_root))
     if template_required:
         flag("high", "new_template_requirements",
-             "New required-call candidates; execution may depend on template conditions.", template_required)
+             "New required-call candidates; paths are relative to the owning chart and calls may be conditional.",
+             [{"template": template, "path": path} for template, path in template_required])
     for dependency in dependencies:
         flag("high" if dependency["major_bump"] or dependency["kind"] == "removed" else "medium",
              "dependency_change", "Review dependency overrides and upgrade instructions.", dependency)
@@ -322,6 +333,10 @@ def assess_risk(old_root, new_root, values, templates, metadata, dependencies, c
         flag("high" if template["kind"] == "removed" else "medium", "template_change",
              "Template changes may conflict with custom templates or alter deployed resources.",
              {"path": template["path"], "kind": template["kind"], "logic_changes": logic})
+    for crd in crds or []:
+        flag("high", "crd_change",
+             "Review CRD schemas and existing custom resources; Helm does not automatically upgrade/delete CRDs.",
+             {"path": crd["path"], "kind": crd["kind"]})
     old_version, new_version = str(metadata["old"].get("version", "")), str(metadata["new"].get("version", ""))
     if VERSION.fullmatch(old_version) and VERSION.fullmatch(new_version):
         if int(new_version.split(".")[0]) > int(old_version.split(".")[0]):
@@ -352,6 +367,7 @@ def assess_risk(old_root, new_root, values, templates, metadata, dependencies, c
             "Added defaults are not automatically required. Schema requirements and template required calls are separate signals.",
             "Schema analysis covers explicit properties/required only, not $ref, combinators, arrays, or conditional schemas.",
             "Template required-call detection is heuristic; dynamic/indexed lookups and helper indirection may be missed.",
+            "Lists are compared by index; insertions or reordering can produce cascading changes.",
             "Removed keys are detectable; deprecations are only flagged when present in new upstream notices.",
             "Complex dependency ranges require manual review; bundled subchart archives are hashed, not recursively unpacked.",
             "No Helm rendering, Kubernetes validation, or three-way merge with customized templates is performed.",
@@ -367,13 +383,15 @@ def compare_charts(old_root, new_root, custom_values=None):
     old_metadata, new_metadata = read_yaml(old_root / "Chart.yaml"), read_yaml(new_root / "Chart.yaml")
     metadata = {"old": old_metadata, "new": new_metadata, "changes": deep_diff(old_metadata, new_metadata)}
     dependencies = compare_dependencies(old_metadata, new_metadata)
-    templates = []
+    templates, crds = [], []
     for kind in ("added", "removed", "modified"):
         for entry in files[kind]:
             name = entry["path"]
-            if "templates" in PurePosixPath(name).parts:
-                templates.append({"path": name, "kind": kind,
-                                  "diff": unified_diff(old_root / name, new_root / name, name)})
+            parts = PurePosixPath(name).parts
+            if "templates" in parts or "crds" in parts:
+                changes = templates if "templates" in parts else crds
+                changes.append({"path": name, "kind": kind,
+                                "diff": unified_diff(old_root / name, new_root / name, name)})
     lock = {"old": read_yaml(old_root / "Chart.lock") if (old_root / "Chart.lock").is_file() else None,
             "new": read_yaml(new_root / "Chart.lock") if (new_root / "Chart.lock").is_file() else None}
     lock["changes"] = deep_diff(lock["old"], lock["new"])
@@ -381,9 +399,10 @@ def compare_charts(old_root, new_root, custom_values=None):
     return {
         "report_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": files, "values": values, "templates": sorted(templates, key=lambda t: t["path"]),
+        "crds": sorted(crds, key=lambda c: c["path"]),
         "metadata": metadata, "dependencies": dependencies, "dependency_lock": lock,
         "schema_diff": schema_diff,
-        "risk": assess_risk(old_root, new_root, values, templates, metadata, dependencies, custom_values),
+        "risk": assess_risk(old_root, new_root, values, templates, metadata, dependencies, custom_values, crds),
     }
 
 
@@ -397,6 +416,7 @@ def summary_text(report):
         f"{counts['removed']} removed, {counts['modified']} modified, {counts['unchanged']} unchanged",
         f"Values: {len(report['values'])} changes",
         f"Templates: {len(report['templates'])} changes",
+        f"CRDs: {len(report['crds'])} changes",
         f"Dependencies: {len(report['dependencies'])} changes",
         f"Risk: {report['risk']['level'].upper()} (static analysis)",
         "", "Potential breaking changes and customization risks:",
@@ -406,7 +426,7 @@ def summary_text(report):
         key = (finding["severity"], finding["category"], finding["message"])
         grouped[key] = grouped.get(key, 0) + 1
     for (severity, category, message), count in grouped.items():
-        lines.append(f"- [{severity.upper()}] {category} ({count} findings): {message}")
+        lines.append(f"- [{severity.upper()}] {category} ({count} {'finding' if count == 1 else 'findings'}): {message}")
     if not report["risk"]["findings"]:
         lines.append("- No static risk signals detected; this is not a deployment safety guarantee.")
     lines.extend(["", "Limitations:"] + [f"- {item}" for item in report["risk"]["limitations"]])
@@ -424,7 +444,7 @@ def highlighted_diff(diff):
 def report_html(report):
     def data_section(title, value):
         text = json.dumps(value, indent=2, ensure_ascii=False)
-        tokens = re.compile(r'("(?:\\.|[^"\\])*")(\s*:)?|\b(?:true|false|null|-?\d+(?:\.\d+)?)\b')
+        tokens = re.compile(r'("(?:\\.|[^"\\])*")(\s*:)?|\b(?:true|false|null)\b|(?<![\w.])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b')
         parts, end = [], 0
         for match in tokens.finditer(text):
             parts.append(html.escape(text[end:match.start()]))
@@ -443,11 +463,13 @@ def report_html(report):
                          ("Dependency lock", "dependency_lock"), ("Risk assessment", "risk")):
         if key in report:
             sections.append(data_section(heading, report[key]))
-    sections.append("<section><h2>Template diffs</h2>")
-    for template in report["templates"]:
-        sections.append(f"<details open><summary>{html.escape(template['kind'] + ': ' + template['path'])}</summary>"
-                        + highlighted_diff(template["diff"]) + "</details>")
-    sections.append("</section><section><h2>Values schema diff</h2>" + highlighted_diff(report["schema_diff"]) + "</section>")
+    for title, key in (("Template diffs", "templates"), ("CRD diffs", "crds")):
+        sections.append(f"<section><h2>{title}</h2>")
+        for change in report[key]:
+            sections.append(f"<details open><summary>{html.escape(change['kind'] + ': ' + change['path'])}</summary>"
+                            + highlighted_diff(change["diff"]) + "</details>")
+        sections.append("</section>")
+    sections.append("<section><h2>Values schema diff</h2>" + highlighted_diff(report["schema_diff"]) + "</section>")
     return """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">

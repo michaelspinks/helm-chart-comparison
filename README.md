@@ -81,6 +81,8 @@ upstream changes are recorded.
 * **Templates:** complete unified diffs for every added, removed, or modified
   file under any `templates/` directory, including helpers, NOTES, and unpacked
   dependency templates, not only `.yaml` files.
+* **CRDs:** separate unified diffs and high-risk findings for changed files under
+  `crds/` directories, including unpacked dependencies.
 * **Metadata:** complete old/new `Chart.yaml` and recursive field differences.
 * **Dependencies:** additions/removals and all changed dependency fields,
   matched by alias or name; semantic major-version increases are flagged for
@@ -96,7 +98,7 @@ upstream changes are recorded.
 ### Programmatic use
 
 `report.json` has `report_version: 1` and top-level `generated_at`, `sources`,
-`files`, `values`, `templates`, `metadata`, `dependencies`, `dependency_lock`,
+`files`, `values`, `templates`, `crds`, `metadata`, `dependencies`, `dependency_lock`,
 `schema_diff`, and `risk` fields. `sources` includes download URLs and archive
 SHA256 hashes (integrity records, **not** signature verification).
 Each value change has `path`, `kind` (`added`, `removed`, `modified`),
@@ -123,10 +125,13 @@ safety guarantee. A high risk means manual review is needed, not that an upgrade
 will necessarily fail. New defaults are **not** automatically considered required.
 Schema-required values may already have defaults, and nested requirements only
 apply when their parent objects exist. Template `required` calls may be conditional.
+Their evidence includes the owning template filename; value paths are local to
+that template's chart, not necessarily the top-level chart.
 
 Schema detection covers explicit `properties`/`required`, not `$ref`, combinators,
 array items, or conditional schemas. Template detection cannot fully interpret
 Go templates, dynamic/indexed values, helper indirection, or runtime behavior.
+Lists are compared by index, so insertions or reordering may cause cascading diffs.
 Removed keys are detectable; deprecated keys are only flagged through new
 upstream deprecation notices, not an authoritative deprecation catalog.
 Bundled `.tgz` dependencies are hashed as files, not recursively unpacked.

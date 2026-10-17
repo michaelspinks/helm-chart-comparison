@@ -75,7 +75,8 @@ dependencies:
         self.assertEqual(report["risk"]["level"], "high")
         findings = {f["category"]: f for f in report["risk"]["findings"]}
         self.assertEqual(findings["new_schema_requirements"]["evidence"], ["/server/token"])
-        self.assertEqual(findings["new_template_requirements"]["evidence"], ["/token"])
+        self.assertEqual(findings["new_template_requirements"]["evidence"],
+                         [{"template": "templates/new.yaml", "path": "/token"}])
         self.assertIn("removed_values", findings)
         self.assertIn("value_type_changes", findings)
         self.assertIn("deprecation_notices", findings)
@@ -126,6 +127,44 @@ dependencies:
     def test_alias_expansion_is_bounded(self):
         with self.assertRaisesRegex(ValueError, "expansion"):
             compare.json_value([1, 2, 3], budget=[2])
+
+    def test_invalid_dependency_metadata_has_clear_errors(self):
+        for dependencies in ("invalid", {}, False, 0, {"name": "x"}, ["invalid"], [{}], [{"alias": "x"}],
+                             [{"name": []}], [{"name": "x", "alias": []}]):
+            with self.subTest(dependencies=dependencies), self.assertRaises(ValueError):
+                compare.compare_dependencies({"dependencies": dependencies}, {})
+
+    def test_crd_changes_have_diffs_and_high_risk(self):
+        self.write(self.old, "charts/crds/crds/resource.yaml",
+                   "kind: CustomResourceDefinition\nspec:\n  scope: Namespaced\n")
+        self.write(self.new, "charts/crds/crds/resource.yaml",
+                   "kind: CustomResourceDefinition\nspec:\n  scope: Cluster\n")
+        report = compare.compare_charts(self.old, self.new)
+        self.assertEqual(report["templates"], [])
+        self.assertEqual(len(report["crds"]), 1)
+        self.assertIn("+  scope: Cluster", report["crds"][0]["diff"])
+        self.assertEqual(report["risk"]["level"], "high")
+        finding = next(f for f in report["risk"]["findings"] if f["category"] == "crd_change")
+        self.assertEqual(finding["evidence"]["path"], "charts/crds/crds/resource.yaml")
+        self.assertIn("CRD diffs", compare.report_html(report))
+
+    def test_required_template_values_retain_owning_template(self):
+        self.write(self.new, "charts/child/templates/secret.yaml",
+                   '{{ required "token" .Values.token }}\n')
+        report = compare.compare_charts(self.old, self.new)
+        finding = next(f for f in report["risk"]["findings"] if f["category"] == "new_template_requirements")
+        self.assertEqual(finding["evidence"],
+                         [{"template": "charts/child/templates/secret.yaml", "path": "/token"}])
+
+    def test_root_json_pointer(self):
+        self.assertEqual(compare.deep_diff(None, {"key": 1})[0]["path"], "")
+
+    def test_html_highlights_negative_numbers_as_single_tokens(self):
+        self.write(self.new, "values.yaml", "priority: -1\nthreshold: -1.5e+20\n")
+        report = compare.compare_charts(self.old, self.new)
+        rendered = compare.report_html(report)
+        self.assertIn('<span class="literal">-1</span>', rendered)
+        self.assertIn('<span class="literal">-1.5e+20</span>', rendered)
 
     def test_recursive_yaml_and_unsafe_tags_rejected(self):
         self.write(self.old, "values.yaml", "loop: &loop\n  child: *loop\n")
